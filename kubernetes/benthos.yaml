@@ -61,7 +61,8 @@ data:
       processors:
         - bloblang: |
             root = this
-            root.signature_valid = if meta("X-Hub-Signature-256") == content().string().hash("hmac_sha256","${SECRET_KEY}").encode("hex") {
+            root.signature = meta("X-Hub-Signature-256").split("=").index(1)
+            root.signature_valid = if root.signature == content().string().hash("hmac_sha256","${SECRET_KEY}").encode("hex") {
               true
             } else {
               false
