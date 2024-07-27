@@ -1,0 +1,143 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: benthos-deployment
+  namespace: benthos
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: benthos
+  template:
+    metadata:
+      labels:
+        app: benthos
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: '4040'
+    spec:
+      containers:
+      - name: benthos
+        image: jeffail/benthos:4.27
+        args: ["-r", "/etc/config/resources.yaml", "-c", "/etc/config/config.yaml","streams", "/config"]  # add this line to start Benthos in streams mode
+        env:
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: benthos-secret
+              key: secret-key
+        ports:   
+          - containerPort: 8080
+            name: http-port
+          - containerPort: 4040
+            name: metrics-port
+        volumeMounts:
+        - name: config-streams-volume
+          mountPath: /config
+        - name: config-volume
+          mountPath: /etc/config
+      volumes:
+        - name: config-streams-volume
+          configMap:
+            name: benthos-streams-cm
+        - name: config-volume
+          configMap:
+            name: benthos-config-cm
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: benthos-streams-cm
+  namespace: benthos
+data:
+  github.yaml: |
+    input:
+      label: webhook
+      http_server:
+        path: "/webhook"
+        rate_limit: "flood_protect"
+
+    pipeline:
+      processors:
+        - bloblang: |
+            root = this
+            root.signature_valid = if meta("X-Hub-Signature-256") == content().string().hash("hmac_sha256","${SECRET_KEY}").encode("hex") {
+              true
+            } else {
+              false
+            }
+
+    output:
+      switch:
+        cases:
+          - check: 'this.signature_valid == true'
+            output:
+              nats_jetstream:
+                urls:
+                  - nats://nats.nats.svc.cluster.local:4222
+                subject: ci.actions.release
+          - output:
+              reject: "Invalid signature"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: benthos-config-cm
+data:
+  config.yaml: |
+    http:
+      enabled: true
+      address: 0.0.0.0:8080
+      root_path: /api
+      debug_endpoints: false
+
+    metrics:
+      prometheus: {}
+
+  resources.yaml: |
+    rate_limit_resources:
+      - label: flood_protect
+        local:
+          count: 100
+          interval: 1s
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  annotations:
+  name: benthos-routes
+  namespace: benthos
+spec:
+  hostnames:
+  - events.mydomain
+  parentRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: eg
+    namespace: envoy-gateway-system
+  rules:
+  - backendRefs:
+    - group: ""
+      kind: Service
+      name: benthos
+      port: 8080
+      weight: 1
+    matches:
+    - path:
+        type: PathPrefix
+        value: /
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: benthos
+  namespace: benthos
+spec:
+  selector:
+    app: benthos
+  ports:
+    - protocol: TCP
+      name: "http"
+      port: 8080
+      targetPort: 8080
